@@ -79,7 +79,7 @@ async function startVoiceCycle() {
 
     // ১ ঘণ্টা (৬০ মিনিট) অপেক্ষা করা
     console.log('১ ঘণ্টার টাইমার শুরু হচ্ছে...');
-    await new Promise((resolve) => setTimeout(resolve, 60 * 60 * 1000));
+    await new Promise((resolve) => setTimeout(resolve, 10 * 1000));
     console.log('১ ঘণ্টা শেষ। এখন কথা বলবে।');
 
     const player = createAudioPlayer();
