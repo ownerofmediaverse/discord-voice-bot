@@ -1,11 +1,12 @@
+
 import {
   Client,
   GatewayIntentBits,
+  Events,
   REST,
   Routes,
   SlashCommandBuilder,
-  PermissionFlagsBits,
-  Events
+  ChannelType
 } from "discord.js";
 
 import {
@@ -21,216 +22,183 @@ import {
 import { getAudioUrl } from "google-tts-api";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
-import { Readable } from "node:stream";
 import ffmpegPath from "ffmpeg-static";
 
-// ===============================
-// ENVIRONMENT SETTINGS
-// ===============================
+// ==========================================
+// 1. ENVIRONMENT VARIABLES
+// ==========================================
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID;
 const VOICE_CHANNEL_ID = process.env.VOICE_CHANNEL_ID;
 
-const PORT = Number(process.env.PORT || 3000);
-const INTERVAL_MINUTES = Number(
-  process.env.REMINDER_INTERVAL_MINUTES || 60
+const PORT = Number(process.env.PORT || 10000);
+
+const REMINDER_INTERVAL_MINUTES = Math.max(
+  1,
+  Number(process.env.REMINDER_INTERVAL_MINUTES || 60)
 );
 
 const REMINDER_TEXT =
   process.env.REMINDER_TEXT ||
   "এক ঘণ্টা হয়ে গেছে। গেম শেষ করে পরের ম্যাচে নতুন করে ঢুকুন।";
 
-if (!TOKEN || !CLIENT_ID || !GUILD_ID || !VOICE_CHANNEL_ID) {
-  console.error("Missing required Environment Variables.");
+// ==========================================
+// 2. STARTUP DIAGNOSTIC LOGS
+// ==========================================
+
+console.log("======================================");
+console.log("DISCORD BANGLA REMINDER BOT STARTING");
+console.log("======================================");
+
+console.log("Node Version:", process.version);
+console.log("Token Exists:", Boolean(TOKEN));
+console.log("Client ID Exists:", Boolean(CLIENT_ID));
+console.log("Guild ID Exists:", Boolean(GUILD_ID));
+console.log("Voice Channel ID Exists:", Boolean(VOICE_CHANNEL_ID));
+console.log("FFmpeg Available:", Boolean(ffmpegPath));
+console.log("Reminder Interval:", REMINDER_INTERVAL_MINUTES);
+console.log("Reminder Text:", REMINDER_TEXT);
+
+const missingVariables = [];
+
+if (!TOKEN) missingVariables.push("DISCORD_TOKEN");
+if (!CLIENT_ID) missingVariables.push("CLIENT_ID");
+if (!GUILD_ID) missingVariables.push("GUILD_ID");
+if (!VOICE_CHANNEL_ID) missingVariables.push("VOICE_CHANNEL_ID");
+
+if (missingVariables.length > 0) {
+  console.error("MISSING ENVIRONMENT VARIABLES:", missingVariables.join(", "));
   process.exit(1);
 }
 
 if (!ffmpegPath) {
-  console.error("FFmpeg executable was not found.");
+  console.error("FFMPEG ERROR: ffmpeg-static binary not found.");
   process.exit(1);
 }
 
-// ===============================
-// HTTP HEALTH CHECK SERVER
-// ===============================
-
-const server = createServer((req, res) => {
-  if (req.url === "/health" || req.url === "/") {
-    res.writeHead(200, {
-      "Content-Type": "application/json"
-    });
-
-    res.end(JSON.stringify({
-      status: "online",
-      bot: client?.user?.tag || "starting",
-      voice: connection?.state?.status || "not-connected"
-    }));
-
-    return;
-  }
-
-  res.writeHead(404);
-  res.end("Not Found");
-});
-
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Health server listening on port ${PORT}`);
-});
-
-// ===============================
-// DISCORD CLIENT
-// ===============================
+// ==========================================
+// 3. DISCORD CLIENT
+// ==========================================
 
 const client = new Client({
   intents: [
-    GatewayIntentBits.Guilds
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildVoiceStates
   ]
 });
 
 const player = createAudioPlayer();
 
 let connection = null;
-let manualLeave = false;
-let reconnectTimer = null;
 let reminderTimer = null;
-let reminderStarted = false;
-let reminderRunning = false;
+let reconnectTimer = null;
+let reminderBusy = false;
+let manualLeaving = false;
+let lastError = null;
+let lastReminderAt = null;
 
-// ===============================
-// SLASH COMMANDS
-// ===============================
+// ==========================================
+// 4. HTTP HEALTH SERVER
+// ==========================================
 
-const commands = [
-  new SlashCommandBuilder()
-    .setName("join")
-    .setDescription("Bot voice channel-এ join করবে")
-    .setDefaultMemberPermissions(
-      PermissionFlagsBits.ManageGuild
-    ),
+const server = createServer((req, res) => {
+  res.setHeader("Content-Type", "application/json");
+  res.setHeader("Access-Control-Allow-Origin", "*");
 
-  new SlashCommandBuilder()
-    .setName("leave")
-    .setDescription("Bot voice channel থেকে বের হবে")
-    .setDefaultMemberPermissions(
-      PermissionFlagsBits.ManageGuild
-    ),
+  if (req.url === "/health") {
+    const voiceState = connection?.state?.status || "not-connected";
 
-  new SlashCommandBuilder()
-    .setName("status")
-    .setDescription("Bot-এর বর্তমান অবস্থা দেখাবে")
-    .setDefaultMemberPermissions(
-      PermissionFlagsBits.ManageGuild
-    ),
+    res.writeHead(200);
 
-  new SlashCommandBuilder()
-    .setName("test")
-    .setDescription("একটি পরীক্ষামূলক Reminder পাঠাবে")
-    .setDefaultMemberPermissions(
-      PermissionFlagsBits.ManageGuild
-    )
-].map(command => command.toJSON());
+    res.end(JSON.stringify({
+      status: "online",
+      bot: client.user?.tag || "starting",
+      botId: client.user?.id || null,
+      voice: voiceState,
+      guildId: GUILD_ID,
+      voiceChannelId: VOICE_CHANNEL_ID,
+      reminderIntervalMinutes: REMINDER_INTERVAL_MINUTES,
+      reminderBusy,
+      lastReminderAt,
+      lastError
+    }, null, 2));
 
-async function registerCommands() {
-  const rest = new REST({ version: "10" }).setToken(TOKEN);
-
-  await rest.put(
-    Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID),
-    { body: commands }
-  );
-
-  console.log("Slash commands registered.");
-}
-
-// ===============================
-// VOICE CONNECTION
-// ===============================
-
-async function joinVoice() {
-  manualLeave = false;
-
-  if (connection) {
-    try {
-      connection.destroy();
-    } catch {}
-    connection = null;
+    return;
   }
 
-  const guild = await client.guilds.fetch(GUILD_ID);
-  const channel = await guild.channels.fetch(VOICE_CHANNEL_ID);
+  res.writeHead(200);
 
-  if (!channel || !channel.isVoiceBased()) {
-    throw new Error("Voice channel not found.");
+  res.end(JSON.stringify({
+    message: "Discord Bangla Reminder Bot is running."
+  }));
+});
+
+server.listen(PORT, "0.0.0.0", () => {
+  console.log("HEALTH SERVER LISTENING ON PORT:", PORT);
+  console.log("HEALTH URL: /health");
+});
+
+// ==========================================
+// 5. AUDIO PLAYER LOGS
+// ==========================================
+
+player.on(AudioPlayerStatus.Playing, () => {
+  console.log("AUDIO PLAYER: Playing.");
+});
+
+player.on(AudioPlayerStatus.Idle, () => {
+  console.log("AUDIO PLAYER: Idle.");
+});
+
+player.on("error", (error) => {
+  lastError = error.message;
+  console.error("AUDIO PLAYER ERROR:", error);
+});
+
+// ==========================================
+// 6. REMINDER TIMER
+// ==========================================
+
+function stopReminderLoop() {
+  if (reminderTimer) {
+    clearInterval(reminderTimer);
+    reminderTimer = null;
+    console.log("REMINDER TIMER STOPPED.");
+  }
+}
+
+function startReminderLoop() {
+  if (reminderTimer) {
+    console.log("REMINDER TIMER ALREADY RUNNING.");
+    return;
   }
 
-  connection = joinVoiceChannel({
-    channelId: channel.id,
-    guildId: guild.id,
-    adapterCreator: guild.voiceAdapterCreator,
-    selfDeaf: true,
-    selfMute: false
-  });
+  const intervalMs = REMINDER_INTERVAL_MINUTES * 60 * 1000;
 
-  connection.subscribe(player);
-
-  connection.on("error", error => {
-    console.error("Voice connection error:", error);
-  });
-
-  connection.on(
-    VoiceConnectionStatus.Disconnected,
-    () => {
-      console.log("Voice disconnected.");
-
-      if (!manualLeave) {
-        scheduleReconnect();
-      }
-    }
+  console.log(
+    `REMINDER TIMER STARTED: Every ${REMINDER_INTERVAL_MINUTES} minutes.`
   );
 
-  await entersState(
-    connection,
-    VoiceConnectionStatus.Ready,
-    30000
-  );
+  // প্রথম Reminder সঙ্গে সঙ্গে পাঠাবে
+  runReminder("initial").catch((error) => {
+    console.error("INITIAL REMINDER ERROR:", error);
+  });
 
-  console.log("Bot connected to voice channel.");
-
-  startReminderLoop();
+  reminderTimer = setInterval(() => {
+    runReminder("scheduled").catch((error) => {
+      console.error("SCHEDULED REMINDER ERROR:", error);
+    });
+  }, intervalMs);
 }
 
-// ===============================
-// RECONNECT SYSTEM
-// ===============================
-
-function scheduleReconnect() {
-  if (manualLeave || reconnectTimer) return;
-
-  reconnectTimer = setTimeout(async () => {
-    reconnectTimer = null;
-
-    try {
-      console.log("Trying to reconnect...");
-      await joinVoice();
-    } catch (error) {
-      console.error("Reconnect failed:", error);
-      scheduleReconnect();
-    }
-  }, 10000);
-}
-
-// ===============================
-// BANGLA TTS PLAYBACK
-// ===============================
+// ==========================================
+// 7. GOOGLE BANGLA TTS + FFMPEG
+// ==========================================
 
 async function playTTSOnce() {
-  if (
-    !connection ||
-    connection.state.status !== VoiceConnectionStatus.Ready
-  ) {
-    throw new Error("Voice connection is not ready.");
-  }
+  console.log("TTS: Preparing Bangla voice...");
 
   const audioUrl = await getAudioUrl(REMINDER_TEXT, {
     lang: "bn",
@@ -238,11 +206,22 @@ async function playTTSOnce() {
     host: "https://translate.google.com"
   });
 
+  console.log("TTS: Audio URL generated.");
+
   const response = await fetch(audioUrl);
 
-  if (!response.ok || !response.body) {
-    throw new Error("TTS audio download failed.");
+  if (!response.ok) {
+    throw new Error(`TTS DOWNLOAD FAILED: HTTP ${response.status}`);
   }
+
+  const audioBuffer = Buffer.from(await response.arrayBuffer());
+
+  if (audioBuffer.length === 0) {
+    throw new Error("TTS returned an empty audio file.");
+  }
+
+  console.log("TTS: Audio downloaded:", audioBuffer.length, "bytes");
+  console.log("FFMPEG: Starting audio conversion...");
 
   const ffmpeg = spawn(ffmpegPath, [
     "-hide_banner",
@@ -254,210 +233,495 @@ async function playTTSOnce() {
     "pipe:1"
   ]);
 
-  ffmpeg.on("error", error => {
-    console.error("FFmpeg error:", error);
+  ffmpeg.stderr.on("data", (data) => {
+    console.error("FFMPEG STDERR:", data.toString());
   });
 
-  Readable.fromWeb(response.body).pipe(ffmpeg.stdin);
+  ffmpeg.on("error", (error) => {
+    console.error("FFMPEG PROCESS ERROR:", error);
+  });
 
   const resource = createAudioResource(ffmpeg.stdout, {
     inputType: StreamType.Raw
   });
 
-  await new Promise((resolve, reject) => {
+  const playbackPromise = new Promise((resolve, reject) => {
+    let finished = false;
+
     const timeout = setTimeout(() => {
-      cleanup();
-      ffmpeg.kill();
-      reject(new Error("Audio playback timed out."));
+      finish(new Error("Audio playback timed out."));
     }, 90000);
 
-    function cleanup() {
+    function finish(error) {
+      if (finished) return;
+
+      finished = true;
       clearTimeout(timeout);
-      player.off(AudioPlayerStatus.Idle, onIdle);
-      player.off("error", onError);
+
+      player.removeListener(AudioPlayerStatus.Idle, onIdle);
+      player.removeListener("error", onPlayerError);
+
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
     }
 
     function onIdle() {
-      cleanup();
-      resolve();
+      finish();
     }
 
-    function onError(error) {
-      cleanup();
-      ffmpeg.kill();
-      reject(error);
+    function onPlayerError(error) {
+      finish(error);
     }
 
     player.once(AudioPlayerStatus.Idle, onIdle);
-    player.once("error", onError);
+    player.once("error", onPlayerError);
+
+    console.log("TTS: Sending audio to Discord voice player.");
 
     player.play(resource);
   });
+
+  ffmpeg.stdin.on("error", (error) => {
+    console.error("FFMPEG INPUT ERROR:", error.message);
+  });
+
+  ffmpeg.stdin.end(audioBuffer);
+
+  await playbackPromise;
+
+  console.log("TTS: Playback completed successfully.");
 }
 
-// ===============================
-// REMINDER SYSTEM
-// ===============================
+// ==========================================
+// 8. SEND REMINDER TWICE
+// ==========================================
 
-const wait = ms =>
-  new Promise(resolve => setTimeout(resolve, ms));
+async function runReminder(source = "manual") {
+  if (reminderBusy) {
+    console.log("REMINDER SKIPPED: Another reminder is running.");
+    return false;
+  }
 
-async function sendReminder() {
-  if (reminderRunning) return;
+  if (!connection || connection.state.status !== VoiceConnectionStatus.Ready) {
+    console.log("REMINDER SKIPPED: Voice connection is not ready.");
+    return false;
+  }
 
-  reminderRunning = true;
+  reminderBusy = true;
+
+  console.log("======================================");
+  console.log("REMINDER STARTED:", source);
+  console.log("======================================");
 
   try {
-    console.log("Playing reminder...");
+    await playTTSOnce();
+
+    console.log("REMINDER: Waiting 5 seconds.");
+
+    await new Promise((resolve) => setTimeout(resolve, 5000));
 
     await playTTSOnce();
 
-    await wait(5000);
+    lastReminderAt = new Date().toISOString();
 
-    await playTTSOnce();
+    console.log("REMINDER COMPLETED: Both messages played.");
+    return true;
 
-    console.log("Reminder completed.");
   } catch (error) {
-    console.error("Reminder failed:", error);
+    lastError = error.message;
+    console.error("REMINDER PLAYBACK FAILED:", error);
+    return false;
+
   } finally {
-    reminderRunning = false;
+    reminderBusy = false;
   }
 }
 
-function startReminderLoop() {
-  if (reminderStarted) return;
+// ==========================================
+// 9. VOICE CHANNEL JOIN
+// ==========================================
 
-  reminderStarted = true;
+async function joinVoice() {
+  console.log("VOICE: Trying to join channel:", VOICE_CHANNEL_ID);
 
-  // First reminder immediately after connection
-  sendReminder();
+  const guild = await client.guilds.fetch(GUILD_ID);
 
-  // Repeat at the configured interval
-  reminderTimer = setInterval(() => {
-    sendReminder();
-  }, INTERVAL_MINUTES * 60 * 1000);
+  const channel = await guild.channels.fetch(VOICE_CHANNEL_ID);
 
-  console.log(
-    `Reminder interval: ${INTERVAL_MINUTES} minutes`
-  );
+  if (!channel) {
+    throw new Error("VOICE CHANNEL NOT FOUND. Check VOICE_CHANNEL_ID.");
+  }
+
+  if (
+    channel.type !== ChannelType.GuildVoice &&
+    channel.type !== ChannelType.GuildStageVoice
+  ) {
+    throw new Error("Selected channel is not a voice or stage channel.");
+  }
+
+  const botMember = await guild.members.fetchMe();
+
+  const permissions = channel.permissionsFor(botMember);
+
+  if (!permissions?.has("Connect")) {
+    throw new Error("BOT IS MISSING CONNECT PERMISSION.");
+  }
+
+  if (!permissions?.has("Speak") && channel.type === ChannelType.GuildVoice) {
+    throw new Error("BOT IS MISSING SPEAK PERMISSION.");
+  }
+
+  if (
+    connection &&
+    connection.state.status === VoiceConnectionStatus.Ready
+  ) {
+    console.log("VOICE: Already connected.");
+    return true;
+  }
+
+  if (connection) {
+    try {
+      connection.removeAllListeners();
+      connection.destroy();
+    } catch (error) {
+      console.error("OLD VOICE CONNECTION CLEANUP:", error.message);
+    }
+  }
+
+  manualLeaving = false;
+
+  connection = joinVoiceChannel({
+    channelId: channel.id,
+    guildId: guild.id,
+    adapterCreator: guild.voiceAdapterCreator,
+    selfDeaf: false,
+    selfMute: false
+  });
+
+  connection.subscribe(player);
+
+  connection.on(VoiceConnectionStatus.Ready, () => {
+    console.log("======================================");
+    console.log("SUCCESS: BOT JOINED VOICE CHANNEL!");
+    console.log("VOICE CHANNEL:", channel.name);
+    console.log("======================================");
+
+    startReminderLoop();
+  });
+
+  connection.on(VoiceConnectionStatus.Disconnected, () => {
+    console.error("VOICE: Connection disconnected.");
+
+    if (!manualLeaving) {
+      scheduleReconnect();
+    }
+  });
+
+  connection.on("error", (error) => {
+    lastError = error.message;
+    console.error("VOICE CONNECTION ERROR:", error);
+  });
+
+  connection.on(VoiceConnectionStatus.Destroyed, () => {
+    console.log("VOICE: Connection destroyed.");
+  });
+
+  await entersState(connection, VoiceConnectionStatus.Ready, 30000);
+
+  console.log("VOICE: Ready confirmation received.");
+
+  return true;
 }
 
-// ===============================
-// LEAVE VOICE
-// ===============================
+// ==========================================
+// 10. AUTOMATIC RECONNECT
+// ==========================================
+
+function scheduleReconnect() {
+  if (manualLeaving || reconnectTimer) return;
+
+  console.log("VOICE: Reconnect scheduled in 5 seconds.");
+
+  reconnectTimer = setTimeout(async () => {
+    reconnectTimer = null;
+
+    try {
+      console.log("VOICE: Attempting reconnect...");
+      await joinVoice();
+
+    } catch (error) {
+      lastError = error.message;
+      console.error("VOICE RECONNECT FAILED:", error);
+
+      scheduleReconnect();
+    }
+  }, 5000);
+}
+
+// ==========================================
+// 11. VOICE CHANNEL LEAVE
+// ==========================================
 
 function leaveVoice() {
-  manualLeave = true;
+  console.log("VOICE: Leaving channel...");
+
+  manualLeaving = true;
+
+  stopReminderLoop();
 
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
   }
 
-  if (reminderTimer) {
-    clearInterval(reminderTimer);
-    reminderTimer = null;
-  }
-
-  reminderStarted = false;
+  player.stop(true);
 
   if (connection) {
-    connection.destroy();
+    try {
+      connection.removeAllListeners();
+      connection.destroy();
+    } catch (error) {
+      console.error("VOICE LEAVE ERROR:", error);
+    }
+
     connection = null;
+  }
+
+  console.log("VOICE: Successfully disconnected.");
+
+  return true;
+}
+
+// ==========================================
+// 12. SLASH COMMANDS
+// ==========================================
+
+const commands = [
+  new SlashCommandBuilder()
+    .setName("join")
+    .setDescription("Join the configured reminder voice channel"),
+
+  new SlashCommandBuilder()
+    .setName("start")
+    .setDescription("Start the voice reminder bot"),
+
+  new SlashCommandBuilder()
+    .setName("leave")
+    .setDescription("Leave the voice channel"),
+
+  new SlashCommandBuilder()
+    .setName("stop")
+    .setDescription("Stop voice reminders and leave"),
+
+  new SlashCommandBuilder()
+    .setName("status")
+    .setDescription("Check bot and voice connection status"),
+
+  new SlashCommandBuilder()
+    .setName("test")
+    .setDescription("Play the Bangla reminder immediately")
+].map((command) => command.toJSON());
+
+// ==========================================
+// 13. REGISTER SLASH COMMANDS
+// ==========================================
+
+async function registerCommands() {
+  console.log("COMMANDS: Starting slash command registration...");
+
+  const rest = new REST({ version: "10" }).setToken(TOKEN);
+
+  try {
+    const result = await rest.put(
+      Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID),
+      { body: commands }
+    );
+
+    console.log("======================================");
+    console.log("SUCCESS: SLASH COMMANDS REGISTERED!");
+    console.log("COMMAND COUNT:", result.length);
+    console.log("COMMAND NAMES:", commands.map((c) => c.name).join(", "));
+    console.log("======================================");
+
+  } catch (error) {
+    lastError = error.message;
+
+    console.error("SLASH COMMAND REGISTRATION FAILED:", error);
+    throw error;
   }
 }
 
-// ===============================
-// COMMAND INTERACTIONS
-// ===============================
+// ==========================================
+// 14. INTERACTION HANDLER
+// ==========================================
 
-client.on(Events.InteractionCreate, async interaction => {
+client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
+  console.log("COMMAND RECEIVED:", interaction.commandName);
+  console.log("COMMAND USER:", interaction.user.tag);
+
   try {
-    if (interaction.commandName === "join") {
-      await interaction.deferReply();
+    const command = interaction.commandName;
+
+    if (command === "join" || command === "start") {
+      await interaction.deferReply({ ephemeral: true });
 
       await joinVoice();
 
       await interaction.editReply(
-        "✅ Bot voice channel-এ যুক্ত হয়েছে!"
+        "সফলভাবে Voice Channel-এ Join করার চেষ্টা সম্পন্ন হয়েছে।"
       );
+
+      return;
     }
 
-    else if (interaction.commandName === "leave") {
+    if (command === "leave" || command === "stop") {
       leaveVoice();
 
-      await interaction.reply(
-        "👋 Bot voice channel থেকে বের হয়েছে।"
-      );
+      await interaction.reply({
+        content: "Bot Voice Channel থেকে বের হয়েছে এবং Reminder বন্ধ হয়েছে।",
+        ephemeral: true
+      });
+
+      return;
     }
 
-    else if (interaction.commandName === "status") {
+    if (command === "status") {
+      const voiceStatus = connection?.state?.status || "not-connected";
+
       await interaction.reply({
         content:
-          `Bot: Online\nVoice: ${connection?.state?.status || "Disconnected"}\nReminder: প্রতি ${INTERVAL_MINUTES} মিনিটে`,
+          `**Bot:** ${client.user?.tag || "Offline"}\n` +
+          `**Voice:** ${voiceStatus}\n` +
+          `**Reminder:** ${reminderTimer ? "Running" : "Stopped"}\n` +
+          `**Interval:** ${REMINDER_INTERVAL_MINUTES} minutes`,
         ephemeral: true
       });
+
+      return;
     }
 
-    else if (interaction.commandName === "test") {
-      await interaction.deferReply({
-        ephemeral: true
-      });
+    if (command === "test") {
+      await interaction.deferReply({ ephemeral: true });
 
-      await sendReminder();
+      const success = await runReminder("test-command");
 
       await interaction.editReply(
-        "✅ Test reminder সম্পন্ন হয়েছে।"
+        success
+          ? "বাংলা Reminder সফলভাবে Voice Channel-এ বাজানো হয়েছে।"
+          : "Reminder বাজানো যায়নি। Render Logs পরীক্ষা করুন।"
       );
+
+      return;
     }
+
   } catch (error) {
-    console.error("Command error:", error);
+    lastError = error.message;
 
-    const message = "❌ Command চালাতে সমস্যা হয়েছে।";
+    console.error("COMMAND EXECUTION ERROR:", error);
 
-    if (interaction.deferred || interaction.replied) {
-      await interaction.editReply(message).catch(() => {});
-    } else {
-      await interaction.reply({
-        content: message,
-        ephemeral: true
-      }).catch(() => {});
+    const message = "Command চালাতে সমস্যা হয়েছে। Render Logs পরীক্ষা করুন।";
+
+    try {
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply(message);
+      } else {
+        await interaction.reply({
+          content: message,
+          ephemeral: true
+        });
+      }
+    } catch (replyError) {
+      console.error("COMMAND REPLY ERROR:", replyError);
     }
   }
 });
 
-// ===============================
-// BOT START
-// ===============================
+// ==========================================
+// 15. DISCORD CLIENT EVENTS
+// ==========================================
 
-client.once(Events.ClientReady, async readyClient => {
-  console.log(`Logged in as ${readyClient.user.tag}`);
+client.once(Events.ClientReady, async (readyClient) => {
+  console.log("======================================");
+  console.log("SUCCESS: DISCORD BOT LOGGED IN!");
+  console.log("BOT USER:", readyClient.user.tag);
+  console.log("BOT ID:", readyClient.user.id);
+  console.log("======================================");
 
   try {
     await registerCommands();
-    await joinVoice();
   } catch (error) {
-    console.error("Startup error:", error);
+    console.error("COMMAND REGISTRATION ERROR:", error);
+  }
+
+  try {
+    console.log("STARTUP: Automatic voice join beginning...");
+    await joinVoice();
+
+  } catch (error) {
+    lastError = error.message;
+
+    console.error("AUTOMATIC VOICE JOIN FAILED:", error);
+
     scheduleReconnect();
   }
 });
 
-// ===============================
-// ERROR HANDLING
-// ===============================
-
-player.on("error", error => {
-  console.error("Audio player error:", error);
+client.on("error", (error) => {
+  lastError = error.message;
+  console.error("DISCORD CLIENT ERROR:", error);
 });
 
-process.on("unhandledRejection", error => {
-  console.error("Unhandled rejection:", error);
+client.on("warn", (warning) => {
+  console.warn("DISCORD CLIENT WARNING:", warning);
 });
 
-client.on(Events.Error, error => {
-  console.error("Discord client error:", error);
+client.on("shardError", (error) => {
+  lastError = error.message;
+  console.error("DISCORD GATEWAY ERROR:", error);
 });
 
-client.login(TOKEN);
+client.on("shardDisconnect", (event, shardId) => {
+  console.error("DISCORD SHARD DISCONNECTED:", shardId, event);
+});
+
+client.on("shardReconnecting", (shardId) => {
+  console.log("DISCORD SHARD RECONNECTING:", shardId);
+});
+
+// ==========================================
+// 16. PROCESS ERROR LOGS
+// ==========================================
+
+process.on("unhandledRejection", (error) => {
+  console.error("UNHANDLED PROMISE REJECTION:", error);
+});
+
+process.on("uncaughtException", (error) => {
+  console.error("UNCAUGHT EXCEPTION:", error);
+  process.exit(1);
+});
+
+// ==========================================
+// 17. LOGIN
+// ==========================================
+
+console.log("DISCORD: Sending login request...");
+
+client.login(TOKEN)
+  .then(() => {
+    console.log("DISCORD: Login request accepted.");
+  })
+  .catch((error) => {
+    lastError = error.message;
+
+    console.error("======================================");
+    console.error("DISCORD LOGIN FAILED!");
+    console.error("ERROR MESSAGE:", error.message);
+    console.error("ERROR CODE:", error.code || "unknown");
+    console.error("======================================");
+  });
