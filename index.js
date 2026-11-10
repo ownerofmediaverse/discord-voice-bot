@@ -146,9 +146,7 @@ server.listen(PORT, "0.0.0.0", () => {
 // 5. DISCORD GATEWAY DIAGNOSTIC LOGS
 // ==========================================
 
-client.on("debug", (message) => {
-  console.log("[DISCORD DEBUG]", message);
-});
+
 
 client.on("warn", (message) => {
   console.warn("[DISCORD WARNING]", message);
@@ -791,18 +789,66 @@ console.log("[DISCORD] TOKEN IS PRESENT:", Boolean(TOKEN));
 
 loginStartedAt = Date.now();
 
-client.login(TOKEN)
-  .then(() => {
+
+async function checkDiscordAPI() {
+  console.log("================================");
+  console.log("[API TEST] CHECKING DISCORD API");
+  console.log("================================");
+
+  const endpoints = [
+    "/users/@me",
+    "/gateway/bot"
+  ];
+
+  for (const endpoint of endpoints) {
+    console.log("[API TEST] Checking:", endpoint);
+
+    const response = await fetch(
+      `https://discord.com/api/v10${endpoint}`,
+      {
+        headers: {
+          Authorization: `Bot ${TOKEN}`
+        },
+        signal: AbortSignal.timeout(15000)
+      }
+    );
+
+    console.log("[API TEST] HTTP STATUS:", response.status);
+
+    if (!response.ok) {
+      throw new Error(
+        `Discord API ${endpoint} failed: HTTP ${response.status}`
+      );
+    }
+
+    console.log("[API TEST] SUCCESS:", endpoint);
+  }
+
+  console.log("[API TEST] BOTH TESTS PASSED");
+}
+
+async function startBot() {
+  try {
+    await checkDiscordAPI();
+
+    console.log("[DISCORD] API VERIFIED");
+    console.log("[DISCORD] STARTING GATEWAY LOGIN");
+
+    await client.login(TOKEN);
+
     console.log("[DISCORD] LOGIN PROMISE RESOLVED");
-    console.log("[DISCORD] WAITING FOR CLIENT READY EVENT");
-  })
-  .catch((error) => {
+
+  } catch (error) {
     lastError = error.message;
 
-    console.error("======================================");
-    console.error("DISCORD LOGIN FAILED!");
-    console.error("ERROR NAME:", error.name);
-    console.error("ERROR CODE:", error.code || "unknown");
-    console.error("ERROR MESSAGE:", error.message);
-    console.error("======================================");
-  });
+    console.error("================================");
+    console.error("[STARTUP ERROR]");
+    console.error("NAME:", error.name);
+    console.error("MESSAGE:", error.message);
+    console.error("CODE:", error.code || "NONE");
+    console.error("================================");
+  }
+}
+
+startBot();
+
