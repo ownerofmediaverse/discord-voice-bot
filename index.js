@@ -46,7 +46,7 @@ const REMINDER_TEXT =
   "এক ঘণ্টা হয়ে গেছে। গেম শেষ করে পরের ম্যাচে নতুন করে ঢুকুন।";
 
 // ==================================================
-// 2. SAFE LOGGING
+// 2. LOGGING SYSTEM
 // ==================================================
 
 function log(...args) {
@@ -63,13 +63,8 @@ function logError(label, error) {
     console.error("HTTP STATUS:", error.status);
   }
 
-  const retryAfter =
-    error?.retryAfter ??
-    error?.rawError?.retry_after ??
-    error?.data?.retry_after;
-
-  if (retryAfter !== undefined) {
-    console.error("RETRY AFTER:", retryAfter);
+  if (error?.retryAfter !== undefined) {
+    console.error("RETRY AFTER:", error.retryAfter);
   }
 }
 
@@ -77,7 +72,7 @@ function logError(label, error) {
 // 3. STARTUP VALIDATION
 // ==================================================
 
-log("==========================================");
+log("========================================");
 log("DISCORD BANGLA REMINDER BOT STARTING");
 log("NODE VERSION:", process.version);
 log("TOKEN EXISTS:", Boolean(TOKEN));
@@ -85,8 +80,8 @@ log("CLIENT ID EXISTS:", Boolean(CLIENT_ID));
 log("GUILD ID EXISTS:", Boolean(GUILD_ID));
 log("VOICE CHANNEL ID EXISTS:", Boolean(VOICE_CHANNEL_ID));
 log("FFMPEG AVAILABLE:", Boolean(ffmpegPath));
-log("REMINDER INTERVAL:", REMINDER_INTERVAL_MINUTES, "minutes");
-log("==========================================");
+log("REMINDER INTERVAL:", REMINDER_INTERVAL_MINUTES);
+log("========================================");
 
 const missingVariables = [];
 
@@ -96,12 +91,12 @@ if (!GUILD_ID) missingVariables.push("GUILD_ID");
 if (!VOICE_CHANNEL_ID) missingVariables.push("VOICE_CHANNEL_ID");
 
 if (missingVariables.length > 0) {
-  log("FATAL: MISSING ENVIRONMENT VARIABLES:", missingVariables.join(", "));
+  log("FATAL: MISSING VARIABLES:", missingVariables.join(", "));
   process.exit(1);
 }
 
 if (!ffmpegPath) {
-  log("FATAL: FFMPEG BINARY NOT FOUND");
+  log("FATAL: FFMPEG NOT AVAILABLE");
   process.exit(1);
 }
 
@@ -121,17 +116,74 @@ const player = createAudioPlayer();
 let connection = null;
 let reminderTimer = null;
 let reconnectTimer = null;
+
 let reminderBusy = false;
 let manualLeaving = false;
-let reconnectDelay = 10000;
 
+let reconnectDelay = 10000;
 let lastError = null;
 let lastReminderAt = null;
 let loginStartedAt = Date.now();
 let loginCheckTimer = null;
 
 // ==================================================
-// 5. HEALTH SERVER
+// 5. DISCORD GATEWAY DEBUG
+// ==================================================
+
+// Sensitive debug messages are hidden to protect the token.
+client.on("debug", (message) => {
+  const text = String(message);
+
+  if (/token|authorization|provided token/i.test(text)) {
+    log("[GATEWAY DEBUG] Sensitive message hidden");
+    return;
+  }
+
+  log("[GATEWAY DEBUG]", text);
+});
+
+client.on("shardConnecting", (id) => {
+  log("[GATEWAY] CONNECTING SHARD:", id);
+});
+
+client.on("shardReady", (id) => {
+  log("[GATEWAY] READY SHARD:", id);
+});
+
+client.on("shardReconnecting", (id) => {
+  log("[GATEWAY] RECONNECTING SHARD:", id);
+});
+
+client.on("shardDisconnect", (event, id) => {
+  log("[GATEWAY] DISCONNECTED SHARD:", id);
+  log("[GATEWAY] CLOSE CODE:", event?.code);
+  log(
+    "[GATEWAY] CLOSE REASON:",
+    event?.reason?.toString?.() || "none"
+  );
+});
+
+client.on("shardError", (error, id) => {
+  lastError = error.message;
+  logError("[GATEWAY] SHARD ERROR " + id, error);
+});
+
+client.on("invalidated", () => {
+  lastError = "Discord session invalidated";
+  log("[GATEWAY] SESSION INVALIDATED");
+});
+
+client.on(Events.Warn, (warning) => {
+  log("[DISCORD WARNING]", warning);
+});
+
+client.on(Events.Error, (error) => {
+  lastError = error.message;
+  logError("[DISCORD CLIENT ERROR]", error);
+});
+
+// ==================================================
+// 6. HEALTH SERVER
 // ==================================================
 
 const server = createServer((req, res) => {
@@ -171,46 +223,7 @@ server.on("error", (error) => {
 
 server.listen(PORT, "0.0.0.0", () => {
   log("[HEALTH] SERVER LISTENING ON PORT:", PORT);
-  log("[HEALTH] PATH: /health");
-});
-
-// ==================================================
-// 6. DISCORD GATEWAY EVENTS
-// Never print raw Discord debug messages because
-// some debug messages may contain token information.
-// ==================================================
-
-client.on(Events.Warn, (warning) => {
-  log("[DISCORD WARNING]", warning);
-});
-
-client.on(Events.Error, (error) => {
-  lastError = error.message;
-  logError("[DISCORD CLIENT ERROR]", error);
-});
-
-client.on("shardReady", (shardId) => {
-  log("[GATEWAY] SHARD READY:", shardId);
-});
-
-client.on("shardError", (error, shardId) => {
-  lastError = error.message;
-  logError("[GATEWAY] SHARD ERROR " + shardId, error);
-});
-
-client.on("shardDisconnect", (event, shardId) => {
-  log("[GATEWAY] SHARD DISCONNECTED:", shardId);
-  log("[GATEWAY] CLOSE CODE:", event?.code);
-  log("[GATEWAY] CLOSE REASON:", event?.reason?.toString?.() || "none");
-});
-
-client.on("shardReconnecting", (shardId) => {
-  log("[GATEWAY] SHARD RECONNECTING:", shardId);
-});
-
-client.on("invalidated", () => {
-  lastError = "Discord session invalidated";
-  log("[GATEWAY] SESSION INVALIDATED");
+  log("[HEALTH] HEALTH PATH: /health");
 });
 
 // ==================================================
@@ -219,18 +232,22 @@ client.on("invalidated", () => {
 
 function startLoginDiagnostic() {
   loginCheckTimer = setTimeout(() => {
-    log("==========================================");
+    log("========================================");
     log("[LOGIN CHECK] 60 SECOND DIAGNOSTIC");
     log("BOT READY:", client.isReady());
     log("BOT USER:", client.user?.tag || "NOT READY");
-    log("GATEWAY STATUS:", client.ws.status);
-    log("LOGIN ELAPSED:", Math.round((Date.now() - loginStartedAt) / 1000), "seconds");
+    log("GATEWAY STATUS NUMBER:", client.ws.status);
+    log(
+      "LOGIN ELAPSED:",
+      Math.round((Date.now() - loginStartedAt) / 1000),
+      "SECONDS"
+    );
     log("LAST ERROR:", lastError || "NONE");
-    log("==========================================");
+    log("========================================");
 
     if (!client.isReady()) {
-      log("[LOGIN WARNING] ClientReady has not fired yet.");
-      log("[LOGIN WARNING] Check Gateway/Network/Token errors above.");
+      log("[LOGIN WARNING] CLIENT READY EVENT NOT RECEIVED");
+      log("[LOGIN WARNING] CHECK GATEWAY DEBUG ABOVE");
     }
   }, 60000);
 }
@@ -289,7 +306,7 @@ function startReminderLoop() {
 }
 
 // ==================================================
-// 10. BANGLA TTS AND FFMPEG
+// 10. BANGLA TTS + FFMPEG
 // ==================================================
 
 async function playTTSOnce() {
@@ -312,12 +329,12 @@ async function playTTSOnce() {
 
   const audioBuffer = Buffer.from(await response.arrayBuffer());
 
-  if (audioBuffer.length === 0) {
-    throw new Error("TTS RETURNED EMPTY AUDIO");
+  if (!audioBuffer.length) {
+    throw new Error("TTS AUDIO IS EMPTY");
   }
 
-  log("[TTS] AUDIO DOWNLOADED:", audioBuffer.length, "bytes");
-  log("[FFMPEG] STARTING CONVERSION");
+  log("[TTS] DOWNLOADED:", audioBuffer.length, "BYTES");
+  log("[FFMPEG] STARTING");
 
   const ffmpeg = spawn(ffmpegPath, [
     "-hide_banner",
@@ -329,10 +346,7 @@ async function playTTSOnce() {
     "pipe:1"
   ]);
 
-  let ffmpegError = "";
-
   ffmpeg.stderr.on("data", (data) => {
-    ffmpegError += data.toString();
     console.error("[FFMPEG]", data.toString());
   });
 
@@ -340,24 +354,36 @@ async function playTTSOnce() {
     inputType: StreamType.Raw
   });
 
-  const playbackPromise = new Promise((resolve, reject) => {
+  await new Promise((resolve, reject) => {
     let finished = false;
 
     const timeout = setTimeout(() => {
       finish(new Error("AUDIO PLAYBACK TIMEOUT"));
     }, 90000);
 
-    function finish(error) {
-      if (finished) return;
-      finished = true;
-
+    function cleanup() {
       clearTimeout(timeout);
 
       player.removeListener(AudioPlayerStatus.Idle, onIdle);
       player.removeListener("error", onPlayerError);
+      ffmpeg.removeListener("error", onFfmpegError);
+    }
 
-      if (error) reject(error);
-      else resolve();
+    function finish(error) {
+      if (finished) return;
+
+      finished = true;
+      cleanup();
+
+      if (error) {
+        try {
+          ffmpeg.kill();
+        } catch {}
+
+        reject(error);
+      } else {
+        resolve();
+      }
     }
 
     function onIdle() {
@@ -368,39 +394,37 @@ async function playTTSOnce() {
       finish(error);
     }
 
+    function onFfmpegError(error) {
+      finish(error);
+    }
+
     player.once(AudioPlayerStatus.Idle, onIdle);
     player.once("error", onPlayerError);
+    ffmpeg.once("error", onFfmpegError);
 
-    log("[TTS] STARTING DISCORD AUDIO PLAYBACK");
+    ffmpeg.on("close", (code) => {
+      log("[FFMPEG] PROCESS CLOSED. EXIT CODE:", code);
+
+      if (code !== 0 && code !== null && !finished) {
+        finish(new Error("FFMPEG EXITED WITH CODE " + code));
+      }
+    });
+
+    ffmpeg.stdin.on("error", (error) => {
+      logError("[FFMPEG INPUT ERROR]", error);
+    });
+
+    log("[TTS] STARTING DISCORD PLAYBACK");
 
     player.play(resource);
+    ffmpeg.stdin.end(audioBuffer);
   });
-
-  ffmpeg.on("error", (error) => {
-    logError("[FFMPEG PROCESS ERROR]", error);
-  });
-
-  ffmpeg.on("close", (code) => {
-    log("[FFMPEG] PROCESS CLOSED. EXIT CODE:", code);
-
-    if (code !== 0 && code !== null) {
-      log("[FFMPEG] CONVERSION MAY HAVE FAILED:", ffmpegError);
-    }
-  });
-
-  ffmpeg.stdin.on("error", (error) => {
-    logError("[FFMPEG INPUT ERROR]", error);
-  });
-
-  ffmpeg.stdin.end(audioBuffer);
-
-  await playbackPromise;
 
   log("[TTS] PLAYBACK COMPLETED");
 }
 
 // ==================================================
-// 11. PLAY REMINDER TWICE
+// 11. REMINDER TWICE
 // ==================================================
 
 async function runReminder(source = "manual") {
@@ -413,7 +437,7 @@ async function runReminder(source = "manual") {
     !connection ||
     connection.state.status !== VoiceConnectionStatus.Ready
   ) {
-    log("[REMINDER] FAILED: VOICE CONNECTION NOT READY");
+    log("[REMINDER] FAILED: VOICE NOT READY");
     return false;
   }
 
@@ -447,7 +471,7 @@ async function runReminder(source = "manual") {
 }
 
 // ==================================================
-// 12. VOICE CHANNEL JOIN
+// 12. JOIN VOICE CHANNEL
 // ==================================================
 
 async function joinVoice() {
@@ -462,7 +486,7 @@ async function joinVoice() {
   const channel = await guild.channels.fetch(VOICE_CHANNEL_ID);
 
   if (!channel) {
-    throw new Error("VOICE CHANNEL NOT FOUND. CHECK VOICE_CHANNEL_ID.");
+    throw new Error("VOICE CHANNEL NOT FOUND. CHECK CHANNEL ID.");
   }
 
   if (channel.type !== ChannelType.GuildVoice) {
@@ -500,7 +524,7 @@ async function joinVoice() {
       connection.removeAllListeners();
       connection.destroy();
     } catch (error) {
-      logError("[VOICE] OLD CONNECTION CLEANUP ERROR", error);
+      logError("[VOICE] OLD CONNECTION CLEANUP", error);
     }
 
     connection = null;
@@ -528,10 +552,10 @@ async function joinVoice() {
   });
 
   connection.on(VoiceConnectionStatus.Ready, () => {
-    log("==========================================");
-    log("[VOICE] SUCCESS: BOT JOINED VOICE CHANNEL");
+    log("========================================");
+    log("[VOICE] SUCCESS: BOT JOINED VOICE");
     log("[VOICE] CHANNEL:", channel.name);
-    log("==========================================");
+    log("========================================");
 
     reconnectDelay = 10000;
     startReminderLoop();
@@ -565,7 +589,7 @@ async function joinVoice() {
 }
 
 // ==================================================
-// 13. AUTOMATIC VOICE RECONNECT
+// 13. VOICE AUTO RECONNECT
 // ==================================================
 
 function scheduleReconnect() {
@@ -573,7 +597,7 @@ function scheduleReconnect() {
 
   const delay = reconnectDelay;
 
-  log("[VOICE] RECONNECT SCHEDULED IN", delay / 1000, "SECONDS");
+  log("[VOICE] RECONNECT SCHEDULED:", delay / 1000, "SECONDS");
 
   reconnectTimer = setTimeout(async () => {
     reconnectTimer = null;
@@ -581,7 +605,7 @@ function scheduleReconnect() {
     if (manualLeaving) return;
 
     try {
-      log("[VOICE] RECONNECT ATTEMPT STARTED");
+      log("[VOICE] RECONNECT ATTEMPT");
       await joinVoice();
 
     } catch (error) {
@@ -629,7 +653,7 @@ function leaveVoice() {
 }
 
 // ==================================================
-// 15. SLASH COMMAND DEFINITIONS
+// 15. SLASH COMMANDS
 // ==================================================
 
 const commands = [
@@ -659,7 +683,7 @@ const commands = [
 ].map((command) => command.toJSON());
 
 // ==================================================
-// 16. SLASH COMMAND REGISTRATION
+// 16. REGISTER SLASH COMMANDS
 // ==================================================
 
 async function registerCommands() {
@@ -675,17 +699,17 @@ async function registerCommands() {
       { body: commands }
     );
 
-    log("==========================================");
     log("[COMMANDS] SUCCESS: REGISTERED");
     log("[COMMANDS] COUNT:", result.length);
-    log("[COMMANDS] NAMES:", commands.map((item) => item.name).join(", "));
-    log("==========================================");
+    log(
+      "[COMMANDS] NAMES:",
+      commands.map((item) => item.name).join(", ")
+    );
 
     return true;
 
   } catch (error) {
     lastError = error.message;
-
     logError("[COMMANDS] REGISTRATION FAILED", error);
 
     return false;
@@ -693,7 +717,7 @@ async function registerCommands() {
 }
 
 // ==================================================
-// 17. SLASH COMMAND HANDLER
+// 17. COMMAND HANDLER
 // ==================================================
 
 client.on(Events.InteractionCreate, async (interaction) => {
@@ -733,6 +757,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         content:
           `**Bot:** ${client.user?.tag || "Offline"}\n` +
           `**Gateway:** ${client.ws.status}\n` +
+          `**Ready:** ${client.isReady()}\n` +
           `**Voice:** ${connection?.state?.status || "not-connected"}\n` +
           `**Reminder:** ${reminderTimer ? "Running" : "Stopped"}\n` +
           `**Interval:** ${REMINDER_INTERVAL_MINUTES} minutes`,
@@ -758,7 +783,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
   } catch (error) {
     lastError = error.message;
-    logError("[COMMAND] EXECUTION FAILED", error);
+    logError("[COMMAND EXECUTION FAILED]", error);
 
     try {
       const reply = "Command চালাতে সমস্যা হয়েছে। Render Logs পরীক্ষা করুন।";
@@ -772,13 +797,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
         });
       }
     } catch (replyError) {
-      logError("[COMMAND] REPLY FAILED", replyError);
+      logError("[COMMAND REPLY FAILED]", replyError);
     }
   }
 });
 
 // ==================================================
-// 18. CLIENT READY
+// 18. CLIENT READY EVENT
 // ==================================================
 
 client.once(Events.ClientReady, async (readyClient) => {
@@ -787,22 +812,21 @@ client.once(Events.ClientReady, async (readyClient) => {
     loginCheckTimer = null;
   }
 
-  log("==========================================");
+  log("========================================");
   log("SUCCESS: DISCORD BOT LOGGED IN");
   log("BOT USER:", readyClient.user.tag);
   log("BOT ID:", readyClient.user.id);
-  log("GATEWAY READY:", client.isReady());
-  log("==========================================");
+  log("CLIENT READY:", client.isReady());
+  log("========================================");
 
   const registered = await registerCommands();
 
   if (!registered) {
-    log("[STARTUP] BOT LOGIN SUCCESSFUL, BUT COMMAND REGISTRATION FAILED.");
+    log("[STARTUP] LOGIN SUCCESS, BUT COMMAND REGISTRATION FAILED");
   }
 
   try {
     log("[STARTUP] AUTOMATIC VOICE JOIN STARTED");
-
     await joinVoice();
 
   } catch (error) {
@@ -834,21 +858,20 @@ process.on("uncaughtException", (error) => {
 // ==================================================
 
 async function startDiscordLogin() {
-  log("==========================================");
+  log("========================================");
   log("[DISCORD LOGIN] STARTING");
   log("[DISCORD LOGIN] TOKEN PRESENT:", Boolean(TOKEN));
   log("[DISCORD LOGIN] GATEWAY CONNECTION REQUESTED");
-  log("==========================================");
+  log("========================================");
 
   loginStartedAt = Date.now();
-
   startLoginDiagnostic();
 
   try {
     await client.login(TOKEN);
 
     log("[DISCORD LOGIN] LOGIN PROMISE RESOLVED");
-    log("[DISCORD LOGIN] WAITING FOR CLIENT READY EVENT");
+    log("[DISCORD LOGIN] WAITING FOR CLIENT READY");
 
   } catch (error) {
     lastError = error.message;
@@ -858,7 +881,7 @@ async function startDiscordLogin() {
       loginCheckTimer = null;
     }
 
-    logError("[DISCORD LOGIN] FAILED", error);
+    logError("[DISCORD LOGIN FAILED]", error);
   }
 }
 
