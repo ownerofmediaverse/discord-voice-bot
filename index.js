@@ -1,125 +1,464 @@
-const { Client, GatewayIntentBits } = require('discord.js');
-const {
+
+import {
+  Client,
+  GatewayIntentBits,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+  PermissionFlagsBits,
+  Events
+} from "discord.js";
+
+import {
   joinVoiceChannel,
   createAudioPlayer,
   createAudioResource,
   AudioPlayerStatus,
   VoiceConnectionStatus,
-  entersState,
-} = require('@discordjs/voice');
-const discordTTS = require('discord-tts');
-const express = require('express');
+  StreamType,
+  entersState
+} from "@discordjs/voice";
 
-// ==========================================
-// ১. Render-এর জন্য ছোট ওয়েব সার্ভার (যাতে ঘুমিয়ে না পড়ে)
-// ==========================================
-const app = express();
-app.get('/', (req, res) => res.send('Bot is alive'));
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Web server running on port ${PORT}`));
+import { getAudioUrl } from "google-tts-api";
+import { spawn } from "node:child_process";
+import { createServer } from "node:http";
+import { Readable } from "node:stream";
+import ffmpegPath from "ffmpeg-static";
 
-// ==========================================
-// ২. Discord Bot সেটআপ
-// ==========================================
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildVoiceStates,
-    GatewayIntentBits.GuildMessages,
-  ],
-});
+// ===============================
+// ENVIRONMENT SETTINGS
+// ===============================
 
-// ==========================================
-// ৩. Environment Variables থেকে তথ্য নেওয়া
-// (Render-এ এই তথ্যগুলো সেট করবেন, কোডে বসাবেন না)
-// ==========================================
-const VOICE_CHANNEL_ID = process.env.VOICE_CHANNEL_ID; // আপনার চ্যানেল আইডি
-const GUILD_ID = process.env.GUILD_ID;                 // আপনার সার্ভার আইডি
+const TOKEN = process.env.DISCORD_TOKEN;
+const CLIENT_ID = process.env.CLIENT_ID;
+const GUILD_ID = process.env.GUILD_ID;
+const VOICE_CHANNEL_ID = process.env.VOICE_CHANNEL_ID;
 
-// ==========================================
-// ৪. বট কী বলবে তা এখানে লেখা আছে (চাইলে পরিবর্তন করুন)
-// ==========================================
-const MESSAGE_TEXT = '১ ঘণ্টা হয়ে গেছে, গেম শেষ করে নতুন ম্যাচে ঢুকো';
+const PORT = Number(process.env.PORT || 3000);
+const INTERVAL_MINUTES = Number(
+  process.env.REMINDER_INTERVAL_MINUTES || 60
+);
 
-client.once('ready', () => {
-  console.log(`Logged in as ${client.user.tag}`);
-  startVoiceCycle(); // বট অনলাইনে আসলে টাইমার শুরু হবে
-});
+const REMINDER_TEXT =
+  process.env.REMINDER_TEXT ||
+  "এক ঘণ্টা হয়ে গেছে। গেম শেষ করে পরের ম্যাচে নতুন করে ঢুকুন।";
 
-// Render-এ সেট করা টোকেন দিয়ে লগইন করবে
-client.login(process.env.DISCORD_TOKEN);
+if (!TOKEN || !CLIENT_ID || !GUILD_ID || !VOICE_CHANNEL_ID) {
+  console.error("Missing required Environment Variables.");
+  process.exit(1);
+}
 
-// ==========================================
-// ৫. মূল ভয়েস সাইকেল (জয়েন -> ১ ঘণ্টা অপেক্ষা -> ২ বার বলা -> ডিসকানেক্ট)
-// ==========================================
-async function startVoiceCycle() {
-  const guild = client.guilds.cache.get(GUILD_ID);
-  if (!guild) {
-    console.error('Guild পাওয়া যায়নি। GUILD_ID চেক করুন।');
-    return;
-  }
+if (!ffmpegPath) {
+  console.error("FFmpeg executable was not found.");
+  process.exit(1);
+}
 
-  const voiceChannel = guild.channels.cache.get(VOICE_CHANNEL_ID);
-  if (!voiceChannel) {
-    console.error('Voice channel পাওয়া যায়নি। VOICE_CHANNEL_ID চেক করুন।');
-    return;
-  }
+// ===============================
+// HTTP HEALTH CHECK SERVER
+// ===============================
 
-  try {
-    // ভয়েস চ্যানেলে জয়েন করা
-    const connection = joinVoiceChannel({
-      channelId: voiceChannel.id,
-      guildId: guild.id,
-      adapterCreator: guild.voiceAdapterCreator,
-      selfDeaf: false,
+const server = createServer((req, res) => {
+  if (req.url === "/health" || req.url === "/") {
+    res.writeHead(200, {
+      "Content-Type": "application/json"
     });
 
-    await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
-    console.log('Voice channel-এ কানেক্টেড।');
+    res.end(JSON.stringify({
+      status: "online",
+      bot: client?.user?.tag || "starting",
+      voice: connection?.state?.status || "not-connected"
+    }));
 
-    // ১ ঘণ্টা (৬০ মিনিট) অপেক্ষা করা
-    console.log('১ ঘণ্টার টাইমার শুরু হচ্ছে...');
-    await new Promise((resolve) => setTimeout(resolve, 10 * 1000));
-    console.log('১ ঘণ্টা শেষ। এখন কথা বলবে।');
+    return;
+  }
 
-    const player = createAudioPlayer();
-    connection.subscribe(player);
+  res.writeHead(404);
+  res.end("Not Found");
+});
 
-    // ২ বার মেসেজ বলা
-    for (let i = 1; i <= 2; i++) {
-      console.log(`TTS মেসেজ ${i}/2 বলা হচ্ছে...`);
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`Health server listening on port ${PORT}`);
+});
 
-      // TTS তৈরি করা (lang: 'bn' মানে বাংলা ভয়েস)
-      const stream = discordTTS.getVoiceStream(MESSAGE_TEXT, {
-        lang: 'bn', 
-      });
-      const resource = createAudioResource(stream);
+// ===============================
+// DISCORD CLIENT
+// ===============================
 
-      player.play(resource);
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds
+  ]
+});
 
-      // অডিও বলা শেষ হওয়া পর্যন্ত অপেক্ষা করা
-      await new Promise((resolve, reject) => {
-        const onIdle = (oldState, newState) => {
-          if (newState.status === AudioPlayerStatus.Idle) {
-            player.off('stateChange', onIdle);
-            resolve();
-          }
-        };
-        player.on('stateChange', onIdle);
-        player.once('error', reject);
+const player = createAudioPlayer();
+
+let connection = null;
+let manualLeave = false;
+let reconnectTimer = null;
+let reminderTimer = null;
+let reminderStarted = false;
+let reminderRunning = false;
+
+// ===============================
+// SLASH COMMANDS
+// ===============================
+
+const commands = [
+  new SlashCommandBuilder()
+    .setName("join")
+    .setDescription("Bot voice channel-এ join করবে")
+    .setDefaultMemberPermissions(
+      PermissionFlagsBits.ManageGuild
+    ),
+
+  new SlashCommandBuilder()
+    .setName("leave")
+    .setDescription("Bot voice channel থেকে বের হবে")
+    .setDefaultMemberPermissions(
+      PermissionFlagsBits.ManageGuild
+    ),
+
+  new SlashCommandBuilder()
+    .setName("status")
+    .setDescription("Bot-এর বর্তমান অবস্থা দেখাবে")
+    .setDefaultMemberPermissions(
+      PermissionFlagsBits.ManageGuild
+    ),
+
+  new SlashCommandBuilder()
+    .setName("test")
+    .setDescription("একটি পরীক্ষামূলক Reminder পাঠাবে")
+    .setDefaultMemberPermissions(
+      PermissionFlagsBits.ManageGuild
+    )
+].map(command => command.toJSON());
+
+async function registerCommands() {
+  const rest = new REST({ version: "10" }).setToken(TOKEN);
+
+  await rest.put(
+    Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID),
+    { body: commands }
+  );
+
+  console.log("Slash commands registered.");
+}
+
+// ===============================
+// VOICE CONNECTION
+// ===============================
+
+async function joinVoice() {
+  manualLeave = false;
+
+  if (connection) {
+    try {
+      connection.destroy();
+    } catch {}
+    connection = null;
+  }
+
+  const guild = await client.guilds.fetch(GUILD_ID);
+  const channel = await guild.channels.fetch(VOICE_CHANNEL_ID);
+
+  if (!channel || !channel.isVoiceBased()) {
+    throw new Error("Voice channel not found.");
+  }
+
+  connection = joinVoiceChannel({
+    channelId: channel.id,
+    guildId: guild.id,
+    adapterCreator: guild.voiceAdapterCreator,
+    selfDeaf: true,
+    selfMute: false
+  });
+
+  connection.subscribe(player);
+
+  connection.on("error", error => {
+    console.error("Voice connection error:", error);
+  });
+
+  connection.on(
+    VoiceConnectionStatus.Disconnected,
+    () => {
+      console.log("Voice disconnected.");
+
+      if (!manualLeave) {
+        scheduleReconnect();
+      }
+    }
+  );
+
+  await entersState(
+    connection,
+    VoiceConnectionStatus.Ready,
+    30000
+  );
+
+  console.log("Bot connected to voice channel.");
+
+  startReminderLoop();
+}
+
+// ===============================
+// RECONNECT SYSTEM
+// ===============================
+
+function scheduleReconnect() {
+  if (manualLeave || reconnectTimer) return;
+
+  reconnectTimer = setTimeout(async () => {
+    reconnectTimer = null;
+
+    try {
+      console.log("Trying to reconnect...");
+      await joinVoice();
+    } catch (error) {
+      console.error("Reconnect failed:", error);
+      scheduleReconnect();
+    }
+  }, 10000);
+}
+
+// ===============================
+// BANGLA TTS PLAYBACK
+// ===============================
+
+async function playTTSOnce() {
+  if (
+    !connection ||
+    connection.state.status !== VoiceConnectionStatus.Ready
+  ) {
+    throw new Error("Voice connection is not ready.");
+  }
+
+  const audioUrl = getAudioUrl(REMINDER_TEXT, {
+    lang: "bn",
+    slow: false,
+    host: "https://translate.google.com"
+  });
+
+  const response = await fetch(audioUrl);
+
+  if (!response.ok || !response.body) {
+    throw new Error("TTS audio download failed.");
+  }
+
+  const ffmpeg = spawn(ffmpegPath, [
+    "-hide_banner",
+    "-loglevel", "error",
+    "-i", "pipe:0",
+    "-f", "s16le",
+    "-ar", "48000",
+    "-ac", "2",
+    "pipe:1"
+  ]);
+
+  ffmpeg.on("error", error => {
+    console.error("FFmpeg error:", error);
+  });
+
+  Readable.fromWeb(response.body).pipe(ffmpeg.stdin);
+
+  const resource = createAudioResource(ffmpeg.stdout, {
+    inputType: StreamType.Raw
+  });
+
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      cleanup();
+      ffmpeg.kill();
+      reject(new Error("Audio playback timed out."));
+    }, 90000);
+
+    function cleanup() {
+      clearTimeout(timeout);
+      player.off(AudioPlayerStatus.Idle, onIdle);
+      player.off("error", onError);
+    }
+
+    function onIdle() {
+      cleanup();
+      resolve();
+    }
+
+    function onError(error) {
+      cleanup();
+      ffmpeg.kill();
+      reject(error);
+    }
+
+    player.once(AudioPlayerStatus.Idle, onIdle);
+    player.once("error", onError);
+
+    player.play(resource);
+  });
+}
+
+// ===============================
+// REMINDER SYSTEM
+// ===============================
+
+const wait = ms =>
+  new Promise(resolve => setTimeout(resolve, ms));
+
+async function sendReminder() {
+  if (reminderRunning) return;
+
+  reminderRunning = true;
+
+  try {
+    console.log("Playing reminder...");
+
+    await playTTSOnce();
+
+    await wait(5000);
+
+    await playTTSOnce();
+
+    console.log("Reminder completed.");
+  } catch (error) {
+    console.error("Reminder failed:", error);
+  } finally {
+    reminderRunning = false;
+  }
+}
+
+function startReminderLoop() {
+  if (reminderStarted) return;
+
+  reminderStarted = true;
+
+  // First reminder immediately after connection
+  sendReminder();
+
+  // Repeat at the configured interval
+  reminderTimer = setInterval(() => {
+    sendReminder();
+  }, INTERVAL_MINUTES * 60 * 1000);
+
+  console.log(
+    `Reminder interval: ${INTERVAL_MINUTES} minutes`
+  );
+}
+
+// ===============================
+// LEAVE VOICE
+// ===============================
+
+function leaveVoice() {
+  manualLeave = true;
+
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+
+  if (reminderTimer) {
+    clearInterval(reminderTimer);
+    reminderTimer = null;
+  }
+
+  reminderStarted = false;
+
+  if (connection) {
+    connection.destroy();
+    connection = null;
+  }
+}
+
+// ===============================
+// COMMAND INTERACTIONS
+// ===============================
+
+client.on(Events.InteractionCreate, async interaction => {
+  if (!interaction.isChatInputCommand()) return;
+
+  try {
+    if (interaction.commandName === "join") {
+      await interaction.deferReply();
+
+      await joinVoice();
+
+      await interaction.editReply(
+        "✅ Bot voice channel-এ যুক্ত হয়েছে!"
+      );
+    }
+
+    else if (interaction.commandName === "leave") {
+      leaveVoice();
+
+      await interaction.reply(
+        "👋 Bot voice channel থেকে বের হয়েছে।"
+      );
+    }
+
+    else if (interaction.commandName === "status") {
+      await interaction.reply({
+        content:
+          `Bot: Online\nVoice: ${connection?.state?.status || "Disconnected"}\nReminder: প্রতি ${INTERVAL_MINUTES} মিনিটে`,
+        ephemeral: true
       });
     }
 
-    // কথা বলা শেষ -> চ্যানেল থেকে ডিসকানেক্ট
-    console.log('কথা বলা শেষ। ডিসকানেক্ট করছে...');
-    connection.destroy();
+    else if (interaction.commandName === "test") {
+      await interaction.deferReply({
+        ephemeral: true
+      });
 
-    // ডিসকানেক্ট করার ১০ সেকেন্ড পর আবার শুরু হবে (লুপ)
-    console.log('পরের সাইকেল শুরু হবে ১০ সেকেন্ড পরে...');
-    setTimeout(() => startVoiceCycle(), 10_000);
+      await sendReminder();
+
+      await interaction.editReply(
+        "✅ Test reminder সম্পন্ন হয়েছে।"
+      );
+    }
   } catch (error) {
-    console.error('ভয়েস সাইকেলে এরর:', error);
-    // কোনো সমস্যা হলে ৩০ সেকেন্ড পর আবার চেষ্টা করবে
-    setTimeout(() => startVoiceCycle(), 30_000);
+    console.error("Command error:", error);
+
+    const message = "❌ Command চালাতে সমস্যা হয়েছে।";
+
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply(message).catch(() => {});
+    } else {
+      await interaction.reply({
+        content: message,
+        ephemeral: true
+      }).catch(() => {});
+    }
   }
-}
+});
+
+// ===============================
+// BOT START
+// ===============================
+
+client.once(Events.ClientReady, async readyClient => {
+  console.log(`Logged in as ${readyClient.user.tag}`);
+
+  try {
+    await registerCommands();
+    await joinVoice();
+  } catch (error) {
+    console.error("Startup error:", error);
+    scheduleReconnect();
+  }
+});
+
+// ===============================
+// ERROR HANDLING
+// ===============================
+
+player.on("error", error => {
+  console.error("Audio player error:", error);
+});
+
+process.on("unhandledRejection", error => {
+  console.error("Unhandled rejection:", error);
+});
+
+client.on(Events.Error, error => {
+  console.error("Discord client error:", error);
+});
+
+client.login(TOKEN);
