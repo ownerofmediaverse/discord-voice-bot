@@ -1,4 +1,3 @@
-
 import {
   Client,
   GatewayIntentBits,
@@ -233,7 +232,7 @@ async function playTTSOnce() {
     throw new Error("Voice connection is not ready.");
   }
 
-  const audioUrl = getAudioUrl(REMINDER_TEXT, {
+  const audioUrl = await getAudioUrl(REMINDER_TEXT, {
     lang: "bn",
     slow: false,
     host: "https://translate.google.com"
